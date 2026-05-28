@@ -1,0 +1,7 @@
+[modbus]
+address         = "127.0.0.1"   # Modbus TCP 设备 IP 地址
+port            = 502              # 端口号
+slave_id        = 1                # 从站 ID (1-247)
+byte_order      = "BADC"           # 字节序: ABCD / DCBA / CDAB / BADC
+timeout_sec     = 5                # 通信超时时间（秒）
+scan_interval_ms = 1000            # 采集周期（毫秒）
