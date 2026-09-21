@@ -1,79 +1,128 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"modbus-scan/internal/appconfig"
 	"modbus-scan/internal/collector"
-	"modbus-scan/internal/config"
-	"modbus-scan/internal/udm"
+	"modbus-scan/internal/httpapi"
+	"modbus-scan/internal/logging"
+	"modbus-scan/internal/pointcsv"
+	"modbus-scan/internal/realtime"
+	devruntime "modbus-scan/internal/runtime"
+	"modbus-scan/internal/service"
+	"modbus-scan/internal/store"
+	webassets "modbus-scan/web"
 )
 
 func main() {
-	// 命令行参数
-	var (
-		configFile string
-		csvFile    string
-		validate   bool
-	)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "modbus-scan: %v\n", err)
+		os.Exit(1)
+	}
+}
 
-	flag.StringVar(&configFile, "config", "config.toml", "TOML 配置文件路径")
-	flag.StringVar(&csvFile, "csv", "points.csv", "点位 CSV 文件路径")
-	flag.BoolVar(&validate, "validate", false, "仅验证 CSV 配置文件，不启动采集服务")
-	flag.Parse()
-
-	// 验证模式：仅加载并校验 CSV，输出结果后退出
-	if validate {
-		points, err := config.LoadPointsFromCSV(csvFile)
+func run(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("modbus-scan", flag.ContinueOnError)
+	configPath := flags.String("config", "configs/config.toml", "服务 TOML 配置文件路径")
+	csvPath := flags.String("csv", "", "离线校验的点位 CSV 文件路径")
+	validate := flags.Bool("validate", false, "仅验证 CSV，不启动服务")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("parse flags: %w", err)
+	}
+	if *validate {
+		if *csvPath == "" {
+			return errors.New("validate mode requires -csv")
+		}
+		file, err := os.Open(*csvPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[FAIL] CSV 验证失败: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("open CSV: %w", err)
 		}
-		fmt.Printf("[OK] CSV 验证通过，共 %d 个有效点位:\n", len(points))
-		fmt.Printf("%-20s %-14s %8s %-10s %4s %4s %8s %8s %s\n",
-			"TagName", "RegType", "Address", "DataType", "Bit", "Len", "Scale", "Offset", "Writeable")
-		fmt.Println("--------------------------------------------------------------------------------")
-		for _, p := range points {
-			fmt.Printf("%-20s %-14s %8d %-10s %4d %4d %8.2f %8.2f %t\n",
-				p.TagName, p.RegType, p.Address, p.DataType, p.BitOffset, p.BitLen, p.Scale, p.Offset, p.Writeable)
+		points, rowErrors, parseErr := pointcsv.Parse(file)
+		closeErr := file.Close()
+		if parseErr != nil {
+			return fmt.Errorf("validate CSV: %w", parseErr)
 		}
-		return
+		if closeErr != nil {
+			return fmt.Errorf("close CSV: %w", closeErr)
+		}
+		if len(rowErrors) > 0 {
+			details := make([]string, 0, len(rowErrors))
+			for _, rowErr := range rowErrors {
+				details = append(details, fmt.Sprintf("row %d %s: %s", rowErr.Row, rowErr.Field, rowErr.Message))
+			}
+			return fmt.Errorf("validate CSV: %s", strings.Join(details, "; "))
+		}
+		fmt.Printf("[OK] CSV 验证通过，共 %d 个点位\n", len(points))
+		return nil
 	}
 
-	// 正常启动模式
-	cfg, err := config.LoadDeviceConfig(configFile)
+	cfg, err := appconfig.Load(*configPath)
 	if err != nil {
-		log.Fatalf("加载配置文件失败 [%s]: %v", configFile, err)
+		return err
 	}
-
-	connMgr := collector.NewConnManager(cfg)
-	if err := connMgr.Connect(); err != nil {
-		log.Fatalf("首次连接设备失败: %v", err)
-	}
-
-	points, err := config.LoadPointsFromCSV(csvFile)
+	logger, logCloser, err := logging.New(cfg.Log)
 	if err != nil {
-		log.Fatalf("点位配置加载失败 [%s]: %v", csvFile, err)
+		return err
+	}
+	defer logCloser.Close()
+
+	database, err := store.Open(ctx, cfg.Database.Path, time.Duration(cfg.Database.BusyTimeoutMs)*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+
+	realtimeHub := realtime.NewHub(500)
+	manager := devruntime.NewManager(database, collector.NewRuntimeFactory(realtimeHub.Publish))
+	for _, startErr := range manager.StartEnabled(ctx) {
+		logger.Error("start configured device", "error", startErr)
+	}
+	devices := service.NewDeviceService(database, manager)
+	points := service.NewPointService(database)
+	router := httpapi.NewRouter(logger, devices, points, webassets.Assets, realtimeHub)
+	server := httpapi.NewServer(cfg.Server, router)
+
+	serveErrors := make(chan error, 1)
+	go func() {
+		logger.Info("HTTP service started", "address", server.Addr)
+		err := server.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErrors <- err
+			return
+		}
+		serveErrors <- nil
+	}()
+
+	var serveErr error
+	select {
+	case <-ctx.Done():
+	case serveErr = <-serveErrors:
 	}
 
-	chunks := config.OptimizeChunks(points)
-	udmInstance := udm.New()
-	c := collector.NewCollector(connMgr, udmInstance, chunks, cfg)
-
-	scanInterval := time.Duration(cfg.Modbus.ScanIntervalMs) * time.Millisecond
-	go c.ScanLoop(scanInterval)
-
-	log.Printf("[INFO] Modbus 数据采集服务已启动 (周期: %v, 点位数: %d, 配置: %s, CSV: %s)",
-		scanInterval, len(points), configFile, csvFile)
-
-	// 优雅退出：监听系统信号
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-quit
-	log.Printf("[INFO] 收到信号 %v，服务正在关闭...", sig)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Server.ShutdownTimeoutSec)*time.Second)
+	defer cancel()
+	httpErr := server.Shutdown(shutdownCtx)
+	runtimeErr := manager.StopAll(shutdownCtx)
+	if serveErr != nil {
+		serveErr = fmt.Errorf("serve HTTP: %w", serveErr)
+	}
+	if httpErr != nil {
+		httpErr = fmt.Errorf("shutdown HTTP: %w", httpErr)
+	}
+	if runtimeErr != nil {
+		runtimeErr = fmt.Errorf("stop devices: %w", runtimeErr)
+	}
+	return errors.Join(serveErr, httpErr, runtimeErr)
 }

@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Modbus 设备管理</title><link rel="stylesheet" href="/css/app.css"></head>
+<body>
+<header><h1>Modbus 设备管理</h1><button id="add-device">添加设备</button></header>
+<main>
+  <div id="notice" class="notice" hidden></div>
+  <section class="card"><table><thead><tr><th>名称</th><th>地址</th><th>状态</th><th>点位</th><th>最后采集</th><th>操作</th></tr></thead><tbody id="devices"></tbody></table><p id="empty">暂无设备，请添加设备。</p></section>
+</main>
+<dialog id="device-dialog"><form id="device-form"><h2>设备配置</h2><input type="hidden" id="device-id"><label>名称<input id="name" required maxlength="128"></label><label>地址<input id="address" required value="127.0.0.1"></label><label>端口<input id="port" required type="number" min="1" max="65535" value="502"></label><label>Slave ID<input id="slave-id" required type="number" min="1" max="247" value="1"></label><label>字节序<select id="byte-order"><option>ABCD</option><option>DCBA</option><option>CDAB</option><option>BADC</option></select></label><label>超时（秒）<input id="timeout" type="number" min="1" value="5"></label><label>采集周期（毫秒）<input id="interval" type="number" min="100" value="2000"></label><div class="actions"><button type="button" data-close>取消</button><button type="submit">保存</button></div></form></dialog>
+<script src="/js/api.js"></script><script src="/js/devices.js"></script>
+</body></html>

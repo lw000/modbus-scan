@@ -1,1 +1,7 @@
 modbus-scan.exe
+/.gocache/
+/data/
+/logs/
+*.db
+*.db-shm
+*.db-wal

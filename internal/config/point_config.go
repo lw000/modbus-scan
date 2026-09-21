@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
+
+	"modbus-scan/internal/model"
 )
 
 // validDataTypes 支持的数据类型集合
@@ -22,6 +26,12 @@ var validRegTypes = map[string]bool{
 	"InputReg":    true, // 输入寄存器 (FC04)
 	"CoilStatus":  true, // 线圈 (FC01/FC05/FC15)
 	"InputStatus": true, // 离散输入 (FC02)
+}
+
+var validTagNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func isValidTagName(tagName string) bool {
+	return validTagNamePattern.MatchString(tagName)
 }
 
 // IsRegTypeBit 判断寄存器类型是否为按位访问 (线圈/离散输入)
@@ -45,17 +55,82 @@ func TypeBitWidth(dataType string) int {
 	}
 }
 
+// ValidatePoint validates a point independently of its storage or transport.
+func ValidatePoint(point model.Point) []model.FieldError {
+	errors := make([]model.FieldError, 0)
+	if utf8.RuneCountInString(strings.TrimSpace(point.Description)) > 255 {
+		errors = append(errors, model.FieldError{Field: "description", Message: "must be at most 255 characters"})
+	}
+	if point.Writeable != 0 && point.Writeable != 1 {
+		errors = append(errors, model.FieldError{Field: "writeable", Message: "must be 0 or 1"})
+	}
+	if !isValidTagName(point.TagName) {
+		errors = append(errors, model.FieldError{Field: "tag_name", Message: "must contain only letters, digits, and underscores and cannot start with a digit"})
+	}
+	if !validRegTypes[point.RegType] {
+		errors = append(errors, model.FieldError{Field: "reg_type", Message: "unsupported register type"})
+		return errors
+	}
+	if !validDataTypes[point.DataType] {
+		errors = append(errors, model.FieldError{Field: "data_type", Message: "unsupported data type"})
+		return errors
+	}
+	if IsRegTypeBit(point.RegType) {
+		if point.DataType != "Bool" {
+			errors = append(errors, model.FieldError{Field: "data_type", Message: "coil and input status points require Bool"})
+		}
+		if point.BitOffset != 0 || point.BitLen != 0 {
+			errors = append(errors, model.FieldError{Field: "bit_offset", Message: "bit fields must be zero for coil and input status points"})
+		}
+		return errors
+	}
+	if point.BitOffset < 0 || point.BitLen < 0 {
+		errors = append(errors, model.FieldError{Field: "bit_offset", Message: "bit offset and length must not be negative"})
+		return errors
+	}
+	width := TypeBitWidth(point.DataType)
+	if point.DataType == "Bool" && (point.BitOffset != 0 || point.BitLen != 0) {
+		errors = append(errors, model.FieldError{Field: "bit_offset", Message: "Bool bit offset and length must be zero"})
+	}
+	if (point.DataType == "Float32" || point.DataType == "Double") && (point.BitOffset != 0 || point.BitLen != 0) {
+		errors = append(errors, model.FieldError{Field: "bit_len", Message: "floating-point types do not support bit extraction"})
+	}
+	if point.DataType != "Bool" && point.DataType != "Float32" && point.DataType != "Double" && point.BitOffset == 0 && point.BitLen == 0 {
+		errors = append(errors, model.FieldError{Field: "bit_len", Message: "bit length is required"})
+	}
+	effectiveLen := point.BitLen
+	if point.BitOffset > 0 && effectiveLen == 0 {
+		effectiveLen = 1
+	}
+	if point.BitOffset >= width || effectiveLen > width || point.BitOffset+effectiveLen > width {
+		errors = append(errors, model.FieldError{Field: "bit_len", Message: "bit offset and length exceed the data type width"})
+	}
+	registerCount := 1
+	switch point.DataType {
+	case "Int32", "UInt32", "Float32":
+		registerCount = 2
+	case "Double":
+		registerCount = 4
+	}
+	if int(point.Address)+registerCount-1 > 65535 {
+		errors = append(errors, model.FieldError{Field: "address", Message: "point exceeds the Modbus address range"})
+	}
+	if point.Writeable == 1 && point.RegType != "HoldingReg" && point.RegType != "CoilStatus" {
+		errors = append(errors, model.FieldError{Field: "writeable", Message: "only holding registers and coils can be writeable"})
+	}
+	return errors
+}
+
 // PointConfig 单个数据点位的配置
 type PointConfig struct {
-	TagName   string
-	RegType   string
-	Address   uint16
-	DataType  string
-	BitOffset int // 位偏移 (仅寄存器类型有效，线圈类型忽略)
-	BitLen    int // 位长度 (1~N=显式位提取; BitOffset>0时允许0表示读取该偏移位的1位)
-	Scale     float64
-	Offset    float64
-	Writeable bool
+	TagName     string
+	Description string
+	RegType     string
+	Address     uint16
+	DataType    string
+	BitOffset   int // 位偏移 (仅寄存器类型有效，线圈类型忽略)
+	BitLen      int // 位长度 (1~N=显式位提取; BitOffset>0时允许0表示读取该偏移位的1位)
+	Writeable   bool
 }
 
 // GetRegisterCount 返回该数据类型占用的 Modbus 寄存器数量
@@ -75,7 +150,7 @@ func (p *PointConfig) GetRegisterCount() uint16 {
 }
 
 // LoadPointsFromCSV 从 CSV 文件加载点位配置
-// CSV 列顺序: TagName, RegType, Address, DataType, BitOffset, BitLen, Scale, Offset, Writeable
+// CSV 列顺序: TagName, RegType, Address, DataType, BitOffset, BitLen, Writeable, Description
 func LoadPointsFromCSV(filePath string) ([]PointConfig, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -92,6 +167,15 @@ func LoadPointsFromCSV(filePath string) ([]PointConfig, error) {
 	if len(records) < 2 {
 		return nil, fmt.Errorf("CSV 文件至少需要包含表头和一行数据")
 	}
+	expectedHeader := []string{"TagName", "RegType", "Address", "DataType", "BitOffset", "BitLen", "Writeable", "Description"}
+	if len(records[0]) != len(expectedHeader) {
+		return nil, fmt.Errorf("CSV 表头必须为 %s", strings.Join(expectedHeader, ","))
+	}
+	for index, name := range expectedHeader {
+		if strings.TrimSpace(strings.TrimPrefix(records[0][index], "\uFEFF")) != name {
+			return nil, fmt.Errorf("CSV 表头必须为 %s", strings.Join(expectedHeader, ","))
+		}
+	}
 
 	var points []PointConfig
 	tagSet := make(map[string]bool)
@@ -99,12 +183,12 @@ func LoadPointsFromCSV(filePath string) ([]PointConfig, error) {
 
 	for i, record := range records {
 		lineNum := i // 跳过表头后，第1行数据为行号1
-		if i == 0 { // 跳过表头
+		if i == 0 {  // 跳过表头
 			continue
 		}
-		if len(record) < 9 {
+		if len(record) != 8 {
 			validationErrors = append(validationErrors,
-				fmt.Sprintf("第 %d 行: 列数不足，需要至少 9 列，当前 %d 列", lineNum, len(record)))
+				fmt.Sprintf("第 %d 行: 列数无效，需要 8 列，当前 %d 列", lineNum, len(record)))
 			continue
 		}
 
@@ -114,6 +198,11 @@ func LoadPointsFromCSV(filePath string) ([]PointConfig, error) {
 
 		if tagName == "" {
 			validationErrors = append(validationErrors, fmt.Sprintf("第 %d 行: TagName 不能为空", lineNum))
+			continue
+		}
+		if !isValidTagName(tagName) {
+			validationErrors = append(validationErrors,
+				fmt.Sprintf("第 %d 行 [%s]: TagName 无效，仅允许英文、数字、下划线，且不能以数字开头", lineNum, tagName))
 			continue
 		}
 		if !validRegTypes[regType] {
@@ -215,21 +304,19 @@ func LoadPointsFromCSV(filePath string) ([]PointConfig, error) {
 			continue
 		}
 
-		scale, scaleErr := strconv.ParseFloat(strings.TrimSpace(record[6]), 64)
-		if scaleErr != nil {
+		writeableValue, writeableErr := strconv.Atoi(strings.TrimSpace(record[6]))
+		if writeableErr != nil || (writeableValue != 0 && writeableValue != 1) {
 			validationErrors = append(validationErrors,
-				fmt.Sprintf("第 %d 行 [%s]: Scale [%s] 不是有效的数值", lineNum, tagName, record[5]))
+				fmt.Sprintf("第 %d 行 [%s]: Writeable 必须为 0 或 1", lineNum, tagName))
 			continue
 		}
-
-		offset, offsetErr := strconv.ParseFloat(strings.TrimSpace(record[7]), 64)
-		if offsetErr != nil {
+		description := strings.TrimSpace(record[7])
+		if utf8.RuneCountInString(description) > 255 {
 			validationErrors = append(validationErrors,
-				fmt.Sprintf("第 %d 行 [%s]: Offset [%s] 不是有效的数值", lineNum, tagName, record[6]))
+				fmt.Sprintf("第 %d 行 [%s]: Description 最多 255 个字符", lineNum, tagName))
 			continue
 		}
-
-		writeable := strings.ToLower(strings.TrimSpace(record[8])) == "true"
+		writeable := writeableValue == 1
 
 		if tagSet[tagName] {
 			validationErrors = append(validationErrors,
@@ -239,21 +326,23 @@ func LoadPointsFromCSV(filePath string) ([]PointConfig, error) {
 		tagSet[tagName] = true
 
 		points = append(points, PointConfig{
-			TagName:   tagName,
-			RegType:   regType,
-			Address:   uint16(addr),
-			DataType:  dataType,
-			BitOffset: bitOff,
-			BitLen:    bitLen,
-			Scale:     scale,
-			Offset:    offset,
-			Writeable: writeable,
+			TagName:     tagName,
+			Description: description,
+			RegType:     regType,
+			Address:     uint16(addr),
+			DataType:    dataType,
+			BitOffset:   bitOff,
+			BitLen:      bitLen,
+			Writeable:   writeable,
 		})
 	}
 
 	// 输出校验失败的行（不阻断加载，仅跳过错误行）
 	for _, errMsg := range validationErrors {
 		log.Printf("[WARN] CSV 校验跳过: %s", errMsg)
+	}
+	if len(validationErrors) > 0 {
+		return nil, fmt.Errorf("CSV 配置验证失败: %s", strings.Join(validationErrors, "; "))
 	}
 	if len(points) == 0 {
 		return nil, fmt.Errorf("CSV 配置验证失败: 没有有效的点位配置")

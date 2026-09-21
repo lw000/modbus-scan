@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -19,7 +20,7 @@ import (
 // ================= 连接状态常量 =================
 
 const (
-	StateOnline       int32 = iota
+	StateOnline int32 = iota
 	StateReconnecting
 	StateOffline
 )
@@ -36,11 +37,12 @@ type ConnManager struct {
 	retryCount   int32
 	maxRetries   int32
 	reconnecting int32 // 原子标志，防止并发重连
+	ctx          context.Context
 }
 
 // NewConnManager 创建连接管理器
-func NewConnManager(cfg *config.DeviceConfig) *ConnManager {
-	return &ConnManager{cfg: cfg, maxRetries: 10}
+func NewConnManager(cfg *config.DeviceConfig, ctx context.Context) *ConnManager {
+	return &ConnManager{cfg: cfg, maxRetries: 10, ctx: ctx}
 }
 
 // Connect 建立 Modbus TCP 连接
@@ -85,7 +87,7 @@ func (cm *ConnManager) ReconnectWithBackoff() {
 			log.Printf("[ERROR] 连续 %d 次重连失败，触发熔断！设备进入离线休眠状态", attempt-1)
 			atomic.StoreInt32(&cm.retryCount, 0)
 			atomic.StoreInt32(&cm.state, StateOffline)
-			go cm.startHeartbeatProbe()
+			go cm.startHeartbeatProbe(cm.ctx)
 			return
 		}
 
@@ -94,7 +96,15 @@ func (cm *ConnManager) ReconnectWithBackoff() {
 			float64(maxDelay),
 		))
 		log.Printf("[WARN] 第 %d/%d 次重连，等待 %v...", attempt, cm.maxRetries, delay)
-		time.Sleep(delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-cm.ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
 
 		if err := cm.Connect(); err == nil {
 			log.Println("[INFO] 断线重连成功！")
@@ -106,21 +116,40 @@ func (cm *ConnManager) ReconnectWithBackoff() {
 	}
 }
 
+// Close closes the active Modbus connection.
+func (cm *ConnManager) Close() error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.client = nil
+	if cm.handler == nil {
+		return nil
+	}
+	err := cm.handler.Close()
+	cm.handler = nil
+	return err
+}
+
 // startHeartbeatProbe 熔断后的低频心跳探测，每 60 秒尝试一次连接恢复
-func (cm *ConnManager) startHeartbeatProbe() {
+func (cm *ConnManager) startHeartbeatProbe(ctx context.Context) {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		if atomic.LoadInt32(&cm.state) != StateOffline {
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[INFO] 心跳探测收到退出信号")
 			return
-		}
-		log.Printf("[INFO] [离线探测] 尝试向 %s 发起连通性测试...", cm.cfg.Modbus.Address)
-		if err := cm.Connect(); err == nil {
-			log.Println("[INFO] 离线探测成功，设备已恢复在线！")
-			atomic.StoreInt32(&cm.retryCount, 0)
-			atomic.StoreInt32(&cm.state, StateOnline)
-			return
+		case <-ticker.C:
+			if atomic.LoadInt32(&cm.state) != StateOffline {
+				return
+			}
+			log.Printf("[INFO] [离线探测] 尝试向 %s 发起连通性测试...", cm.cfg.Modbus.Address)
+			if err := cm.Connect(); err == nil {
+				log.Println("[INFO] 离线探测成功，设备已恢复在线！")
+				atomic.StoreInt32(&cm.retryCount, 0)
+				atomic.StoreInt32(&cm.state, StateOnline)
+				return
+			}
 		}
 	}
 }
@@ -136,6 +165,9 @@ func (cm *ConnManager) GetClient() modbus.Client {
 	return cm.client
 }
 
+// State returns the current connection state.
+func (cm *ConnManager) State() int32 { return atomic.LoadInt32(&cm.state) }
+
 // ================= 采集器核心引擎 =================
 
 // Collector Modbus 数据采集器
@@ -144,25 +176,44 @@ type Collector struct {
 	udm       *udm.UniversalDataModel
 	chunks    map[string][]config.ReadChunk
 	byteOrder string
+	publish   func(string, udm.Value)
 }
 
 // NewCollector 创建采集器
-func NewCollector(connMgr *ConnManager, u *udm.UniversalDataModel, chunks map[string][]config.ReadChunk, cfg *config.DeviceConfig) *Collector {
-	return &Collector{
+func NewCollector(connMgr *ConnManager, u *udm.UniversalDataModel, chunks map[string][]config.ReadChunk, cfg *config.DeviceConfig, publishers ...func(string, udm.Value)) *Collector {
+	c := &Collector{
 		connMgr:   connMgr,
 		udm:       u,
 		chunks:    chunks,
 		byteOrder: strings.ToUpper(cfg.Modbus.ByteOrder),
 	}
+	if len(publishers) > 0 {
+		c.publish = publishers[0]
+	}
+	return c
 }
 
-// ScanLoop 定时采集主循环
-func (c *Collector) ScanLoop(interval time.Duration) {
+func (c *Collector) updateValue(tag string, value any) {
+	at := time.Now().UTC()
+	c.udm.UpdateAt(tag, value, at)
+	if c.publish != nil {
+		c.publish(tag, udm.Value{Value: value, UpdatedAt: at})
+	}
+}
+
+// ScanLoop 定时采集主循环，通过 ctx 支持优雅退出
+func (c *Collector) ScanLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		c.scanOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[INFO] ScanLoop 收到退出信号，采集循环停止")
+			return
+		case <-ticker.C:
+			c.scanOnce()
+		}
 	}
 }
 
@@ -205,10 +256,9 @@ func (c *Collector) scanOnce() {
 		}
 	}
 
-	c.udm.LogAll()
 }
 
-// parseAndUpdate 将原始字节数据解析为各点位的工程值并更新到 UDM
+// parseAndUpdate 将原始字节数据解析为各点位的采集值并更新到 UDM
 // 对于寄存器类型 (HoldingReg/InputReg)，raw 为字节数组 (每寄存器 2 字节)
 // 对于线圈类型 (CoilStatus/InputStatus)，raw 为位packed数组 (每位 1 个线圈，MSB first)
 func (c *Collector) parseAndUpdate(chunk config.ReadChunk, raw []byte) {
@@ -275,31 +325,31 @@ func (c *Collector) parseAndUpdate(chunk config.ReadChunk, raw []byte) {
 				finalVal = extracted == 1
 			case "Int16":
 				if effectiveLen == 16 {
-					finalVal = float64(int16(extracted))*pt.Scale + pt.Offset
+					finalVal = float64(int16(extracted))
 				} else {
-					finalVal = float64(extracted)*pt.Scale + pt.Offset
+					finalVal = float64(extracted)
 				}
 			case "UInt16":
-				finalVal = float64(extracted)*pt.Scale + pt.Offset
+				finalVal = float64(extracted)
 			case "Int32":
 				if effectiveLen == 32 {
-					finalVal = float64(int32(extracted))*pt.Scale + pt.Offset
+					finalVal = float64(int32(extracted))
 				} else {
-					finalVal = float64(extracted)*pt.Scale + pt.Offset
+					finalVal = float64(extracted)
 				}
 			case "UInt32":
-				finalVal = float64(extracted)*pt.Scale + pt.Offset
+				finalVal = float64(extracted)
 			case "Float32":
 				val := math.Float32frombits(uint32(extracted))
-				finalVal = float64(val)*pt.Scale + pt.Offset
+				finalVal = float64(val)
 			case "Double":
 				val := math.Float64frombits(extracted)
-				finalVal = val*pt.Scale + pt.Offset
+				finalVal = val
 			default:
-				finalVal = float64(extracted)*pt.Scale + pt.Offset
+				finalVal = float64(extracted)
 			}
 		}
-		c.udm.Update(pt.TagName, finalVal)
+		c.updateValue(pt.TagName, finalVal)
 	}
 }
 
