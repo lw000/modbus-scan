@@ -36,8 +36,9 @@ func TestStaticAssets(t *testing.T) {
 }
 
 type stubDevices struct {
-	created    model.Device
-	startCalls int
+	created      model.Device
+	startCalls   int
+	lifecycleErr error
 }
 
 func (s *stubDevices) Create(_ context.Context, d model.Device) (model.Device, error) {
@@ -56,9 +57,12 @@ func (s *stubDevices) Get(_ context.Context, id int64) (service.DeviceView, erro
 func (s *stubDevices) List(context.Context) ([]service.DeviceView, error) {
 	return []service.DeviceView{{Device: model.Device{ID: 1, Name: "plc"}}}, nil
 }
-func (s *stubDevices) Start(context.Context, int64) error   { s.startCalls++; return nil }
-func (s *stubDevices) Stop(context.Context, int64) error    { return nil }
-func (s *stubDevices) Restart(context.Context, int64) error { return nil }
+func (s *stubDevices) Start(context.Context, int64) error {
+	s.startCalls++
+	return s.lifecycleErr
+}
+func (s *stubDevices) Stop(context.Context, int64) error    { return s.lifecycleErr }
+func (s *stubDevices) Restart(context.Context, int64) error { return s.lifecycleErr }
 func (s *stubDevices) Snapshot(_ context.Context, id int64) (devruntime.Snapshot, error) {
 	return devruntime.Snapshot{DeviceID: id, State: devruntime.StateOnline}, nil
 }
@@ -169,6 +173,20 @@ func TestDeviceRoutes(t *testing.T) {
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || devices.startCalls != 1 {
 		t.Fatalf("status=%d calls=%d", rec.Code, devices.startCalls)
+	}
+}
+
+func TestDeviceLifecycleBusyReturnsConflict(t *testing.T) {
+	devices := &stubDevices{lifecycleErr: devruntime.ErrDeviceBusy}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/devices/1/restart", nil)
+	rec := httptest.NewRecorder()
+	testRouter(devices, &stubPoints{}).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"code":"device_busy"`) || !strings.Contains(body, `"message":"设备正在操作，请稍后重试"`) {
+		t.Fatalf("body=%s", body)
 	}
 }
 

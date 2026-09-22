@@ -116,6 +116,14 @@ Running,CoilStatus,0,Bool,0,0,0,运行状态
 
 单台设备失败不会阻止管理页面或其他设备运行。SIGINT/SIGTERM 会先关闭 HTTP 服务，再停止并等待全部采集任务。
 
+`runtime.operation` 表示当前生命周期操作，可为 `start`、`stop`、`restart`；字段不存在或为空表示当前没有操作。同一设备正在执行生命周期操作时，后续启动、停止或重启请求不会排队，而是返回 HTTP `409 Conflict`：
+
+```json
+{"error":{"code":"device_busy","message":"设备正在操作，请稍后重试"}}
+```
+
+设备列表页和详情页通过状态轮询同步该字段并禁用生命周期按钮。不同设备之间仍可并行操作。
+
 ## 数据备份
 
 停止程序后备份 `data/modbus-scan.db`。运行期间 SQLite 使用 WAL，直接复制单个数据库文件可能无法得到一致快照。

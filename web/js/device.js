@@ -55,6 +55,12 @@ function setPage(number) {
   loadPoints().catch(showError);
 }
 
+function setLifecycleBusy(busy) {
+  document.querySelectorAll("#controls [data-action]").forEach(button => {
+    button.disabled = busy;
+  });
+}
+
 function renderRuntime(runtime) {
   const state = document.querySelector("#runtime-state");
   if (!state) return;
@@ -62,6 +68,7 @@ function renderRuntime(runtime) {
   state.textContent = runtime.state;
   document.querySelector("#config-pending").hidden = !runtime.config_pending;
   document.querySelector("#runtime-error").textContent = runtime.last_error || "";
+  setLifecycleBusy(Boolean(runtime.operation));
 }
 
 function renderSummary(device, runtime) {
@@ -125,13 +132,13 @@ document.querySelector("#controls").onclick = async event => {
   const button = event.target.closest("[data-action]");
   if (!button) return;
   try {
-    button.disabled = true;
+    setLifecycleBusy(true);
     await api.post(`/api/v1/devices/${id}/${button.dataset.action}`);
     await refresh();
   } catch (error) {
     showError(error);
-  } finally {
-    button.disabled = false;
+    if (error.code === "device_busy") await loadStatus();
+    else setLifecycleBusy(false);
   }
 };
 

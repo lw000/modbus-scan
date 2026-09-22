@@ -22,6 +22,9 @@ const (
 	StateError        = "error"
 )
 
+// ErrDeviceBusy indicates that another lifecycle operation owns the device.
+var ErrDeviceBusy = errors.New("device is busy")
+
 // StatusEvent reports a collector state transition.
 type StatusEvent struct {
 	State           string
@@ -57,6 +60,7 @@ type ConfigSource interface {
 type Snapshot struct {
 	DeviceID            int64                `json:"device_id"`
 	State               string               `json:"state"`
+	Operation           string               `json:"operation,omitempty"`
 	LastError           string               `json:"last_error,omitempty"`
 	LastCollectedAt     *time.Time           `json:"last_collected_at,omitempty"`
 	LoadedConfigVersion int64                `json:"loaded_config_version"`
@@ -72,10 +76,28 @@ type deviceRuntime struct {
 	runner              Runner
 	done                chan struct{}
 	state               string
+	operation           string
 	lastError           string
 	lastCollectedAt     *time.Time
 	loadedConfigVersion int64
 	lastValues          map[string]udm.Value
+}
+
+func (entry *deviceRuntime) tryBeginOperation(operation string) bool {
+	if !entry.opMu.TryLock() {
+		return false
+	}
+	entry.mu.Lock()
+	entry.operation = operation
+	entry.mu.Unlock()
+	return true
+}
+
+func (entry *deviceRuntime) endOperation() {
+	entry.mu.Lock()
+	entry.operation = ""
+	entry.mu.Unlock()
+	entry.opMu.Unlock()
 }
 
 // Manager owns all device runtime instances.
@@ -105,8 +127,10 @@ func (m *Manager) entry(id int64) *deviceRuntime {
 // Start persists enabled state and starts a device if it is not already running.
 func (m *Manager) Start(ctx context.Context, id int64) error {
 	entry := m.entry(id)
-	entry.opMu.Lock()
-	defer entry.opMu.Unlock()
+	if !entry.tryBeginOperation("start") {
+		return ErrDeviceBusy
+	}
+	defer entry.endOperation()
 	device, err := m.source.SetDeviceEnabled(ctx, id, true)
 	if err != nil {
 		return fmt.Errorf("enable device: %w", err)
@@ -178,8 +202,10 @@ func (entry *deviceRuntime) setError(err error) {
 // Stop persists disabled state and stops the active runner.
 func (m *Manager) Stop(ctx context.Context, id int64) error {
 	entry := m.entry(id)
-	entry.opMu.Lock()
-	defer entry.opMu.Unlock()
+	if !entry.tryBeginOperation("stop") {
+		return ErrDeviceBusy
+	}
+	defer entry.endOperation()
 	if _, err := m.source.SetDeviceEnabled(ctx, id, false); err != nil {
 		return fmt.Errorf("disable device: %w", err)
 	}
@@ -210,17 +236,16 @@ func stopLocked(ctx context.Context, entry *deviceRuntime) error {
 	return nil
 }
 
-// Restart reloads and starts the latest enabled configuration.
+// Restart reloads the latest configuration and leaves the device enabled.
 func (m *Manager) Restart(ctx context.Context, id int64) error {
 	entry := m.entry(id)
-	entry.opMu.Lock()
-	defer entry.opMu.Unlock()
-	device, err := m.source.GetDevice(ctx, id)
-	if err != nil {
-		return fmt.Errorf("get device: %w", err)
+	if !entry.tryBeginOperation("restart") {
+		return ErrDeviceBusy
 	}
-	if !device.Enabled {
-		return errors.New("device is disabled")
+	defer entry.endOperation()
+	device, err := m.source.SetDeviceEnabled(ctx, id, true)
+	if err != nil {
+		return fmt.Errorf("enable device: %w", err)
 	}
 	if err := stopLocked(ctx, entry); err != nil {
 		return err
@@ -280,7 +305,7 @@ func (m *Manager) Snapshot(ctx context.Context, id int64) (Snapshot, error) {
 	entry.mu.RLock()
 	runner := entry.runner
 	snapshot := Snapshot{
-		DeviceID: id, State: entry.state, LastError: entry.lastError,
+		DeviceID: id, State: entry.state, Operation: entry.operation, LastError: entry.lastError,
 		LastCollectedAt: entry.lastCollectedAt, LoadedConfigVersion: entry.loadedConfigVersion,
 		ConfigPending: entry.loadedConfigVersion != 0 && device.ConfigVersion != entry.loadedConfigVersion,
 		Values:        copyValues(entry.lastValues),

@@ -135,3 +135,34 @@ func TestDeviceScriptContainsPointTableBehavior(t *testing.T) {
 		}
 	}
 }
+
+func TestLifecycleScriptsHandleBusyDevices(t *testing.T) {
+	apiData, err := fs.ReadFile(Assets, "js/api.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiScript := string(apiData)
+	if !strings.Contains(apiScript, "error.code") || !strings.Contains(apiScript, "body?.error?.code") {
+		t.Error("api errors do not preserve the server error code")
+	}
+
+	listData, err := fs.ReadFile(Assets, "js/devices.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"r.operation", "data-lifecycle", "device_busy", "await load()"} {
+		if !strings.Contains(string(listData), required) {
+			t.Errorf("devices.js missing %q", required)
+		}
+	}
+
+	detailData, err := fs.ReadFile(Assets, "js/device.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"function setLifecycleBusy", "runtime.operation", "device_busy", "await loadStatus()"} {
+		if !strings.Contains(string(detailData), required) {
+			t.Errorf("device.js missing %q", required)
+		}
+	}
+}

@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	devruntime "modbus-scan/internal/runtime"
 	"modbus-scan/internal/service"
 	"modbus-scan/internal/store"
 )
@@ -29,6 +30,8 @@ func handleError(c *gin.Context, err error) {
 	switch {
 	case errors.As(err, &validation):
 		failure(c, http.StatusBadRequest, "validation_failed", "参数校验失败", validation.Fields)
+	case errors.Is(err, devruntime.ErrDeviceBusy):
+		failure(c, http.StatusConflict, "device_busy", "设备正在操作，请稍后重试", nil)
 	case errors.Is(err, store.ErrNotFound):
 		failure(c, http.StatusNotFound, "not_found", "资源不存在", nil)
 	case errors.Is(err, store.ErrConflict):
