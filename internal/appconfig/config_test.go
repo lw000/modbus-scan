@@ -1,6 +1,7 @@
 package appconfig
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,18 +17,68 @@ func writeConfig(t *testing.T, content string) string {
 }
 
 func TestLoadDefaults(t *testing.T) {
-	cfg, err := Load(writeConfig(t, ""))
+	path := writeConfig(t, "")
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Server.Host != "127.0.0.1" || cfg.Server.Port != 8080 {
 		t.Fatalf("server defaults = %s:%d", cfg.Server.Host, cfg.Server.Port)
 	}
-	if cfg.Database.Path != "data/modbus-scan.db" {
-		t.Fatalf("database path = %q", cfg.Database.Path)
+	if want := filepath.Join(filepath.Dir(path), "data", "modbus-scan.db"); cfg.Database.Path != want {
+		t.Fatalf("database path = %q, want %q", cfg.Database.Path, want)
 	}
 	if cfg.Log.Level != "info" || cfg.Log.Format != "text" {
 		t.Fatalf("log defaults = %q/%q", cfg.Log.Level, cfg.Log.Format)
+	}
+}
+
+func TestLoadResolvesRuntimePathsRelativeToConfig(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "configs")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(configDir, "config.toml")
+	content := `[database]
+path = "../data/app.db"
+
+[log]
+console = false
+file = "../logs/app.log"
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(root, "data", "app.db"); cfg.Database.Path != want {
+		t.Fatalf("database path = %q, want %q", cfg.Database.Path, want)
+	}
+	if want := filepath.Join(root, "logs", "app.log"); cfg.Log.File != want {
+		t.Fatalf("log path = %q, want %q", cfg.Log.File, want)
+	}
+}
+
+func TestLoadPreservesAbsoluteRuntimePaths(t *testing.T) {
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "data", "app.db")
+	logPath := filepath.Join(root, "logs", "app.log")
+	path := writeConfig(t, "[database]\npath = "+fmt.Sprintf("%q", databasePath)+
+		"\n[log]\nconsole = false\nfile = "+fmt.Sprintf("%q", logPath)+"\n")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.Path != filepath.Clean(databasePath) {
+		t.Fatalf("database path = %q, want %q", cfg.Database.Path, filepath.Clean(databasePath))
+	}
+	if cfg.Log.File != filepath.Clean(logPath) {
+		t.Fatalf("log path = %q, want %q", cfg.Log.File, filepath.Clean(logPath))
 	}
 }
 

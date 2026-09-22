@@ -32,6 +32,25 @@ go build -o modbus-scan.exe ./cmd/modbus-scan
 ./modbus-scan.exe -validate -csv configs/points.csv
 ```
 
+## 注册为 Windows 服务
+
+请先把可执行文件和配置文件放到固定目录，然后在管理员 PowerShell 中执行：
+
+```powershell
+.\modbus-scan.exe install -config .\configs\config.toml
+.\modbus-scan.exe start
+.\modbus-scan.exe status
+.\modbus-scan.exe restart
+.\modbus-scan.exe stop
+.\modbus-scan.exe uninstall
+```
+
+服务名固定为 `modbus-scan`，显示名为 `Modbus Scan`，使用 Windows `LocalSystem` 账户并随系统自动启动。`start` 对已运行服务、`stop` 对已停止服务均视为成功；卸载前必须先停止服务。
+
+安装时会保存可执行文件和配置文件的绝对路径。安装后不要直接移动这两个文件；如需迁移，请先停止并卸载服务，在新目录重新安装。安装、卸载、启动、停止和重启通常需要管理员权限。
+
+数据库和日志的相对路径以配置文件所在目录为基准，而不是 PowerShell 或 Windows 服务的工作目录。绝对路径保持不变。
+
 ## 服务配置
 
 `configs/config.toml` 只配置服务、数据库和日志，不保存设备参数：
@@ -47,14 +66,14 @@ idle_timeout_sec = 60
 shutdown_timeout_sec = 15
 
 [database]
-path = "data/modbus-scan.db"
+path = "../data/modbus-scan.db"
 busy_timeout_ms = 5000
 
 [log]
 level = "info"
 format = "text"
 console = true
-file = "logs/modbus-scan.log"
+file = "../logs/modbus-scan.log"
 max_size_mb = 50
 max_backups = 10
 max_age_days = 30

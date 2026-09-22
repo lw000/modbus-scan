@@ -8,14 +8,14 @@ idle_timeout_sec = 60
 shutdown_timeout_sec = 15
 
 [database]
-path = "data/modbus-scan.db"
+path = "../data/modbus-scan.db"
 busy_timeout_ms = 5000
 
 [log]
 level = "info"
 format = "text"
 console = true
-file = "logs/modbus-scan.log"
+file = "../logs/modbus-scan.log"
 max_size_mb = 50
 max_backups = 10
 max_age_days = 30

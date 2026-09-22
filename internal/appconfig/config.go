@@ -4,6 +4,7 @@ package appconfig
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -68,14 +69,30 @@ func Default() Config {
 
 // Load reads a TOML configuration file and validates the result.
 func Load(path string) (Config, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve config path: %w", err)
+	}
 	cfg := Default()
-	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+	if _, err := toml.DecodeFile(absPath, &cfg); err != nil {
 		return Config{}, fmt.Errorf("decode service config: %w", err)
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
+	base := filepath.Dir(absPath)
+	cfg.Database.Path = resolvePath(base, cfg.Database.Path)
+	if cfg.Log.File != "" {
+		cfg.Log.File = resolvePath(base, cfg.Log.File)
+	}
 	return cfg, nil
+}
+
+func resolvePath(base, path string) string {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(filepath.Join(base, path))
 }
 
 // Validate checks all externally supplied configuration values.
