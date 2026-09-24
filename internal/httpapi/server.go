@@ -50,6 +50,14 @@ type PointService interface {
 	Export(context.Context, int64, io.Writer) error
 }
 
+// KafkaService is the Kafka configuration API boundary.
+type KafkaService interface {
+	GetSettings(context.Context) (service.KafkaSettingsView, error)
+	UpdateSettings(context.Context, service.KafkaSettingsInput) (service.KafkaSettingsView, error)
+	GetDeviceConfig(context.Context, int64) (model.DeviceKafkaConfig, error)
+	UpdateDeviceConfig(context.Context, int64, model.DeviceKafkaConfig) (model.DeviceKafkaConfig, error)
+}
+
 // NewRouter creates the Gin handler.
 func NewRouter(logger *slog.Logger, devices DeviceService, points PointService, webFS fs.FS, realtimeHubs ...*realtime.Hub) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
@@ -116,6 +124,15 @@ func NewServer(cfg appconfig.ServerConfig, handler http.Handler) *http.Server {
 type handlers struct {
 	devices DeviceService
 	points  PointService
+	kafka   KafkaService
+}
+
+// WithKafka registers Kafka configuration routes on an existing router setup.
+func NewRouterWithKafka(logger *slog.Logger, devices DeviceService, points PointService, kafka KafkaService, webFS fs.FS, hub *realtime.Hub) *gin.Engine {
+	router := NewRouter(logger, devices, points, webFS, hub)
+	h := &handlers{kafka: kafka}
+	h.registerKafka(router.Group("/api/v1"))
+	return router
 }
 
 func parseID(c *gin.Context, name string) (int64, bool) {

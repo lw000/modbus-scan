@@ -31,6 +31,7 @@ let realtimeConnected = false;
 let realtimeSegment = 0;
 let realtimeLatestValue = null;
 let realtimeHoverX = null;
+const deviceKafkaForm = document.querySelector("#device-kafka-form");
 
 const esc = value => String(value ?? "").replace(/[&<>"']/g, char => ({
   "&": "&amp;",
@@ -517,6 +518,10 @@ realtimeCanvas.addEventListener("pointerleave", () => {
 });
 
 initColumnResizing();
+async function loadDeviceKafka(){const cfg=await api.get(`/api/v1/devices/${id}/kafka`);document.querySelector("#device-kafka-enabled").checked=cfg.enabled;document.querySelector("#device-kafka-topic").value=cfg.topic;document.querySelector(`input[name="kafka-mode"][value="${cfg.mode}"]`).checked=true;document.querySelector("#device-kafka-interval").value=cfg.full_interval_sec;document.querySelector("#device-kafka-interval").disabled=cfg.mode==="change"}
+document.querySelectorAll('input[name="kafka-mode"]').forEach(input=>input.onchange=()=>{document.querySelector("#device-kafka-interval").disabled=input.value==="change"&&input.checked});
+deviceKafkaForm.onsubmit=async event=>{event.preventDefault();const mode=document.querySelector('input[name="kafka-mode"]:checked').value;try{await api.put(`/api/v1/devices/${id}/kafka`,{enabled:document.querySelector("#device-kafka-enabled").checked,topic:document.querySelector("#device-kafka-topic").value,mode,full_interval_sec:+document.querySelector("#device-kafka-interval").value});await loadDeviceKafka()}catch(error){showError(error)}};
+loadDeviceKafka().catch(showError);
 refresh();
 setInterval(() => {
   if (!document.hidden) {

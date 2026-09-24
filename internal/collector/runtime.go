@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"modbus-scan/internal/config"
+	"modbus-scan/internal/kafkapub"
 	"modbus-scan/internal/model"
 	"modbus-scan/internal/realtime"
 	devruntime "modbus-scan/internal/runtime"
@@ -14,7 +15,15 @@ import (
 )
 
 // RuntimeFactory adapts the collector to the runtime manager boundary.
-type RuntimeFactory struct{ publish func(realtime.ValueEvent) }
+type ScanPublisher interface {
+	Submit(kafkapub.ScanSnapshot)
+	ResetDevice(int64)
+}
+
+type RuntimeFactory struct {
+	publish   func(realtime.ValueEvent)
+	snapshots ScanPublisher
+}
 
 // NewRuntimeFactory creates a collector runtime factory.
 func NewRuntimeFactory(publishers ...func(realtime.ValueEvent)) *RuntimeFactory {
@@ -25,25 +34,35 @@ func NewRuntimeFactory(publishers ...func(realtime.ValueEvent)) *RuntimeFactory 
 	return factory
 }
 
+// WithScanPublisher attaches the completed-scan destination.
+func (f *RuntimeFactory) WithScanPublisher(publisher ScanPublisher) *RuntimeFactory {
+	f.snapshots = publisher
+	return f
+}
+
 // New creates an immutable device runner.
 func (f *RuntimeFactory) New(device model.Device, points []model.Point, sink devruntime.StatusSink) (devruntime.Runner, error) {
 	if len(points) == 0 {
 		return nil, fmt.Errorf("device has no configured points")
 	}
-	return &runtimeRunner{device: device, points: append([]model.Point(nil), points...), sink: sink, values: udm.New(), publish: f.publish}, nil
+	return &runtimeRunner{device: device, points: append([]model.Point(nil), points...), sink: sink, values: udm.New(), publish: f.publish, snapshots: f.snapshots}, nil
 }
 
 type runtimeRunner struct {
-	device  model.Device
-	points  []model.Point
-	sink    devruntime.StatusSink
-	values  *udm.UniversalDataModel
-	mu      sync.Mutex
-	conn    *ConnManager
-	publish func(realtime.ValueEvent)
+	device    model.Device
+	points    []model.Point
+	sink      devruntime.StatusSink
+	values    *udm.UniversalDataModel
+	mu        sync.Mutex
+	conn      *ConnManager
+	publish   func(realtime.ValueEvent)
+	snapshots ScanPublisher
 }
 
 func (r *runtimeRunner) Run(ctx context.Context) {
+	if r.snapshots != nil {
+		defer r.snapshots.ResetDevice(r.device.ID)
+	}
 	cfg := &config.DeviceConfig{Name: r.device.Name, Enabled: true, Modbus: config.ModbusConfig{Address: r.device.Address, Port: r.device.Port, SlaveID: byte(r.device.SlaveID), ByteOrder: r.device.ByteOrder, TimeoutSec: r.device.TimeoutSec, ScanIntervalMs: r.device.ScanIntervalMs}}
 	configured := make([]config.PointConfig, 0, len(r.points))
 	for _, point := range r.points {
@@ -73,7 +92,20 @@ func (r *runtimeRunner) Run(ctx context.Context) {
 		}
 	}
 	collector := NewCollector(manager, r.values, config.OptimizeChunks(configured), cfg, publish)
+	collector.SetScanComplete(r.publishSnapshot)
 	collector.ScanLoop(ctx, time.Duration(r.device.ScanIntervalMs)*time.Millisecond)
+}
+
+func (r *runtimeRunner) publishSnapshot(successful map[string]any, completedAt time.Time) {
+	if r.snapshots == nil {
+		return
+	}
+	current := r.values.Snapshot()
+	values := make(map[string]any, len(current))
+	for tag, value := range current {
+		values[tag] = value.Value
+	}
+	r.snapshots.Submit(kafkapub.ScanSnapshot{DeviceID: r.device.ID, DeviceName: r.device.Name, CollectedAt: completedAt, SuccessfulValues: successful, CurrentValues: values})
 }
 
 func (r *runtimeRunner) monitorConnectionState(ctx context.Context, manager *ConnManager) {

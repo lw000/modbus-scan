@@ -96,7 +96,13 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, CURRENT_T
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("migrate database: %w", err)
 	}
-	return s.migratePointDescription(ctx)
+	if err := s.migratePointDescription(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateKafkaSettings(ctx); err != nil {
+		return err
+	}
+	return s.migrateDeviceKafkaConfigs(ctx)
 }
 
 func (s *Store) migratePointDescription(ctx context.Context) error {
@@ -120,6 +126,70 @@ func (s *Store) migratePointDescription(ctx context.Context) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit migration 2: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateKafkaSettings(ctx context.Context) error {
+	const migration = `
+CREATE TABLE kafka_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    brokers TEXT NOT NULL DEFAULT '[]',
+    client_id TEXT NOT NULL DEFAULT 'modbus-scan',
+    kafka_version TEXT NOT NULL DEFAULT '3.0.0',
+    security_protocol TEXT NOT NULL DEFAULT '',
+    sasl_mechanism TEXT NOT NULL DEFAULT '',
+    sasl_username TEXT NOT NULL DEFAULT '',
+    sasl_password TEXT NOT NULL DEFAULT '',
+    ssl_ca_location TEXT NOT NULL DEFAULT '',
+    ssl_certificate_location TEXT NOT NULL DEFAULT '',
+    ssl_key_location TEXT NOT NULL DEFAULT '',
+    ssl_endpoint_identification_algorithm TEXT NOT NULL DEFAULT '',
+    queue_capacity INTEGER NOT NULL DEFAULT 1000,
+    updated_at DATETIME NOT NULL
+);
+INSERT INTO kafka_settings(id, updated_at) VALUES(1, CURRENT_TIMESTAMP);
+INSERT INTO schema_migrations(version, applied_at) VALUES(3, CURRENT_TIMESTAMP);`
+	return s.applyMigration(ctx, 3, migration)
+}
+
+func (s *Store) migrateDeviceKafkaConfigs(ctx context.Context) error {
+	const migration = `
+CREATE TABLE device_kafka_configs (
+    device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    topic TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL DEFAULT 'change',
+    full_interval_sec INTEGER NOT NULL DEFAULT 1,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    CHECK (mode IN ('full', 'change'))
+);
+INSERT INTO device_kafka_configs(device_id, created_at, updated_at)
+SELECT id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM devices;
+INSERT INTO schema_migrations(version, applied_at) VALUES(4, CURRENT_TIMESTAMP);`
+	return s.applyMigration(ctx, 4, migration)
+}
+
+func (s *Store) applyMigration(ctx context.Context, version int, statements string) error {
+	var applied int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=?`, version).Scan(&applied); err != nil {
+		return fmt.Errorf("check migration %d: %w", version, err)
+	}
+	if applied != 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration %d: %w", version, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, statements); err != nil {
+		return fmt.Errorf("apply migration %d: %w", version, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration %d: %w", version, err)
 	}
 	return nil
 }

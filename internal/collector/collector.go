@@ -172,11 +172,13 @@ func (cm *ConnManager) State() int32 { return atomic.LoadInt32(&cm.state) }
 
 // Collector Modbus 数据采集器
 type Collector struct {
-	connMgr   *ConnManager
-	udm       *udm.UniversalDataModel
-	chunks    map[string][]config.ReadChunk
-	byteOrder string
-	publish   func(string, udm.Value)
+	connMgr      *ConnManager
+	udm          *udm.UniversalDataModel
+	chunks       map[string][]config.ReadChunk
+	byteOrder    string
+	publish      func(string, udm.Value)
+	scanComplete func(map[string]any, time.Time)
+	scanValues   map[string]any
 }
 
 // NewCollector 创建采集器
@@ -199,6 +201,25 @@ func (c *Collector) updateValue(tag string, value any) {
 	if c.publish != nil {
 		c.publish(tag, udm.Value{Value: value, UpdatedAt: at})
 	}
+	if c.scanValues != nil {
+		c.scanValues[tag] = value
+	}
+}
+
+// SetScanComplete installs the completed-scan callback.
+func (c *Collector) SetScanComplete(callback func(map[string]any, time.Time)) {
+	c.scanComplete = callback
+}
+
+func (c *Collector) completeScan(values map[string]any) {
+	if c.scanComplete == nil {
+		return
+	}
+	detached := make(map[string]any, len(values))
+	for tag, value := range values {
+		detached[tag] = value
+	}
+	c.scanComplete(detached, time.Now().UTC())
 }
 
 // ScanLoop 定时采集主循环，通过 ctx 支持优雅退出
@@ -224,6 +245,7 @@ func (c *Collector) scanOnce() {
 	if client == nil {
 		return
 	}
+	c.scanValues = make(map[string]any)
 
 	for _, readChunks := range c.chunks {
 		for _, chunk := range readChunks {
@@ -249,13 +271,16 @@ func (c *Collector) scanOnce() {
 				log.Printf("[ERROR] Modbus 通信异常 [Addr=%d, Qty=%d]: %v，准备重连...",
 					chunk.StartAddr, chunk.Quantity, err)
 				go c.connMgr.ReconnectWithBackoff()
+				c.scanValues = nil
 				return
 			}
 
 			c.parseAndUpdate(chunk, results)
 		}
 	}
-
+	values := c.scanValues
+	c.scanValues = nil
+	c.completeScan(values)
 }
 
 // parseAndUpdate 将原始字节数据解析为各点位的采集值并更新到 UDM

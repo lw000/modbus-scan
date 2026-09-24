@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"modbus-scan/internal/appconfig"
 	"modbus-scan/internal/collector"
 	"modbus-scan/internal/httpapi"
+	"modbus-scan/internal/kafkapub"
 	"modbus-scan/internal/logging"
 	"modbus-scan/internal/pointcsv"
 	"modbus-scan/internal/realtime"
@@ -117,14 +119,32 @@ func runWithReady(ctx context.Context, args []string, ready func()) (retErr erro
 	}
 	defer database.Close()
 
-	realtimeHub := realtime.NewHub(500)
-	manager := devruntime.NewManager(database, collector.NewRuntimeFactory(realtimeHub.Publish))
-	for _, startErr := range manager.StartEnabled(ctx) {
-		logger.Error("start configured device", "error", startErr)
+	kafkaSettings, err := database.GetKafkaSettings(ctx)
+	if err != nil {
+		return err
 	}
-	devices := service.NewDeviceService(database, manager)
+	coordinator := kafkapub.NewCoordinator(kafkaSettings.QueueCapacity, time.Now, func(total uint64) {
+		logger.Warn("Kafka queue overflow", "dropped_messages", total)
+	})
+	deviceKafkaConfigs, err := database.ListDeviceKafkaConfigs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, deviceKafkaConfig := range deviceKafkaConfigs {
+		coordinator.ApplyDeviceConfig(deviceKafkaConfig)
+	}
+	kafkaManager := kafkapub.NewManager(coordinator, kafkapub.SaramaProducerFactory{})
+	realtimeHub := realtime.NewHub(500)
+	factory := collector.NewRuntimeFactory(realtimeHub.Publish).WithScanPublisher(coordinator)
+	runtimeManager := devruntime.NewManager(database, factory)
+	devices := service.NewDeviceService(database, runtimeManager)
 	points := service.NewPointService(database)
-	router := httpapi.NewRouter(logger, devices, points, webassets.Assets, realtimeHub)
+	configAbs, err := filepath.Abs(*configPath)
+	if err != nil {
+		return fmt.Errorf("resolve config path: %w", err)
+	}
+	kafkaService := service.NewKafkaService(database, kafkaManager, filepath.Dir(configAbs))
+	router := httpapi.NewRouterWithKafka(logger, devices, points, kafkaService, webassets.Assets, realtimeHub)
 	server := httpapi.NewServer(cfg.Server, router)
 	listener, err := net.Listen("tcp", server.Addr)
 	if err != nil {
@@ -141,6 +161,12 @@ func runWithReady(ctx context.Context, args []string, ready func()) (retErr erro
 		}
 		serveErrors <- nil
 	}()
+	if err := kafkaManager.Start(context.Background(), kafkaSettings); err != nil {
+		return fmt.Errorf("start Kafka: %w", err)
+	}
+	for _, startErr := range runtimeManager.StartEnabled(ctx) {
+		logger.Error("start configured device", "error", startErr)
+	}
 	ready()
 
 	var serveErr error
@@ -151,8 +177,9 @@ func runWithReady(ctx context.Context, args []string, ready func()) (retErr erro
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Server.ShutdownTimeoutSec)*time.Second)
 	defer cancel()
+	runtimeErr := runtimeManager.StopAll(shutdownCtx)
+	kafkaErr := kafkaManager.Stop(shutdownCtx)
 	httpErr := server.Shutdown(shutdownCtx)
-	runtimeErr := manager.StopAll(shutdownCtx)
 	if serveErr != nil {
 		serveErr = fmt.Errorf("serve HTTP: %w", serveErr)
 	}
@@ -162,5 +189,8 @@ func runWithReady(ctx context.Context, args []string, ready func()) (retErr erro
 	if runtimeErr != nil {
 		runtimeErr = fmt.Errorf("stop devices: %w", runtimeErr)
 	}
-	return errors.Join(serveErr, httpErr, runtimeErr)
+	if kafkaErr != nil {
+		kafkaErr = fmt.Errorf("stop Kafka: %w", kafkaErr)
+	}
+	return errors.Join(serveErr, httpErr, runtimeErr, kafkaErr)
 }

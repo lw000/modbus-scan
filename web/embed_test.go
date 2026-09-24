@@ -166,3 +166,24 @@ func TestLifecycleScriptsHandleBusyDevices(t *testing.T) {
 		}
 	}
 }
+
+func TestKafkaManagementAssets(t *testing.T) {
+	checks := map[string][]string{
+		"index.html":    {`id="kafka-form" class="kafka-form-grid"`, `class="inline-check full-row"`, `class="actions dialog-actions full-row"`},
+		"device.html":   {`id="device-kafka-form"`, `class="inline-check"`, `class="kafka-mode-row"`, `id="device-kafka-interval" type="number" min="1" max="86400" value="1"`},
+		"css/app.css":   {`.kafka-form-grid`, `.inline-check`, `.kafka-mode-row`},
+		"js/devices.js": {`/api/v1/kafka`, `clear_sasl_password`},
+		"js/device.js":  {`/api/v1/devices/${id}/kafka`, `input[name="kafka-mode"]:checked`},
+	}
+	for name, required := range checks {
+		data, err := fs.ReadFile(Assets, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range required {
+			if !strings.Contains(string(data), value) {
+				t.Errorf("%s missing %q", name, value)
+			}
+		}
+	}
+}

@@ -39,6 +39,18 @@ func TestCollectorUpdateValuePublishesSameTimestamp(t *testing.T) {
 	}
 }
 
+func TestCollectorPublishesDetachedCompletedScan(t *testing.T) {
+	var got map[string]any
+	var completedAt time.Time
+	c := &Collector{scanComplete: func(values map[string]any, at time.Time) { got, completedAt = values, at }}
+	values := map[string]any{"Speed": 42.0}
+	c.completeScan(values)
+	values["Speed"] = 99.0
+	if got["Speed"] != 42.0 || completedAt.IsZero() {
+		t.Fatalf("values=%#v completedAt=%v", got, completedAt)
+	}
+}
+
 func TestRuntimeFactoryRejectsEmptyPoints(t *testing.T) {
 	factory := NewRuntimeFactory()
 	_, err := factory.New(model.Device{ID: 1, Name: "plc"}, nil, func(devruntime.StatusEvent) {})

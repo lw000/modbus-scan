@@ -24,13 +24,24 @@ func scanDevice(row scanner) (model.Device, error) {
 // CreateDevice inserts a device.
 func (s *Store) CreateDevice(ctx context.Context, d model.Device) (model.Device, error) {
 	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx, `INSERT INTO devices(name, enabled, address, port, slave_id, byte_order, timeout_sec, scan_interval_ms, config_version, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`, d.Name, d.Enabled, d.Address, d.Port, d.SlaveID, d.ByteOrder, d.TimeoutSec, d.ScanIntervalMs, now, now)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.Device{}, fmt.Errorf("begin create device: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO devices(name, enabled, address, port, slave_id, byte_order, timeout_sec, scan_interval_ms, config_version, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`, d.Name, d.Enabled, d.Address, d.Port, d.SlaveID, d.ByteOrder, d.TimeoutSec, d.ScanIntervalMs, now, now)
 	if err != nil {
 		return model.Device{}, mapError("create device", err)
 	}
 	id, err := result.LastInsertId()
 	if err != nil {
 		return model.Device{}, fmt.Errorf("create device ID: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO device_kafka_configs(device_id, created_at, updated_at) VALUES(?, ?, ?)`, id, now, now); err != nil {
+		return model.Device{}, mapError("create device Kafka config", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return model.Device{}, fmt.Errorf("commit create device: %w", err)
 	}
 	return s.GetDevice(ctx, id)
 }

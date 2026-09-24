@@ -5,6 +5,8 @@ const empty = document.querySelector("#empty");
 const dialog = document.querySelector("#device-dialog");
 const form = document.querySelector("#device-form");
 let busy = false;
+const kafkaDialog = document.querySelector("#kafka-dialog");
+const kafkaForm = document.querySelector("#kafka-form");
 
 const esc = value => String(value ?? "").replace(/[&<>"']/g, char => ({
   "&": "&amp;",
@@ -102,3 +104,7 @@ document.addEventListener("visibilitychange", () => {});
 load();
 setInterval(() => { if (!document.hidden) load(); }, 2000);
 setInterval(() => { if (document.hidden) load(); }, 10000);
+
+async function openKafkaSettings(){const view=await api.get("/api/v1/kafka"),cfg=view.settings,q=x=>document.querySelector(x);q("#kafka-state").textContent=view.status.state;q("#kafka-error").textContent=view.status.last_error||"";q("#kafka-enabled").checked=cfg.enabled;q("#kafka-brokers").value=(cfg.brokers||[]).join("\n");for(const[f,k]of[["kafka-client-id","client_id"],["kafka-version","kafka_version"],["kafka-security","security_protocol"],["kafka-mechanism","sasl_mechanism"],["kafka-username","sasl_username"],["kafka-ca","ssl_ca_location"],["kafka-cert","ssl_certificate_location"],["kafka-key","ssl_key_location"],["kafka-endpoint","ssl_endpoint_identification_algorithm"],["kafka-queue","queue_capacity"]])q(`#${f}`).value=cfg[k]??"";q("#kafka-password").value="";q("#kafka-clear-password").checked=false;kafkaDialog.showModal()}
+document.querySelector("#kafka-settings").onclick=()=>openKafkaSettings().catch(showError);document.querySelector("[data-kafka-close]").onclick=()=>kafkaDialog.close();
+kafkaForm.onsubmit=async event=>{event.preventDefault();const q=x=>document.querySelector(x),data={enabled:q("#kafka-enabled").checked,brokers:q("#kafka-brokers").value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean),client_id:q("#kafka-client-id").value,kafka_version:q("#kafka-version").value,security_protocol:q("#kafka-security").value,sasl_mechanism:q("#kafka-mechanism").value,sasl_username:q("#kafka-username").value,sasl_password:q("#kafka-password").value,clear_sasl_password:q("#kafka-clear-password").checked,ssl_ca_location:q("#kafka-ca").value,ssl_certificate_location:q("#kafka-cert").value,ssl_key_location:q("#kafka-key").value,ssl_endpoint_identification_algorithm:q("#kafka-endpoint").value,queue_capacity:+q("#kafka-queue").value};try{await api.put("/api/v1/kafka",data);kafkaDialog.close()}catch(error){showError(error)}};

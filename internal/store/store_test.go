@@ -116,6 +116,69 @@ func TestDeviceCRUDAndVersion(t *testing.T) {
 	}
 }
 
+func TestDeviceKafkaConfigDefaultsUpdatesAndCascades(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	device, err := s.CreateDevice(ctx, testDevice("kafka-plc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := device.ConfigVersion
+	cfg, err := s.GetDeviceKafkaConfig(ctx, device.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Enabled || cfg.Topic != "" || cfg.Mode != model.KafkaModeChange || cfg.FullIntervalSec != 1 {
+		t.Fatalf("default config = %#v", cfg)
+	}
+	cfg.Enabled = true
+	cfg.Topic = "plc.values"
+	cfg.Mode = model.KafkaModeFull
+	cfg.FullIntervalSec = 30
+	updated, err := s.UpdateDeviceKafkaConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Enabled || updated.Topic != "plc.values" || updated.Mode != model.KafkaModeFull || updated.FullIntervalSec != 30 {
+		t.Fatalf("updated config = %#v", updated)
+	}
+	after, err := s.GetDevice(ctx, device.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ConfigVersion != before {
+		t.Fatalf("config version changed: %d -> %d", before, after.ConfigVersion)
+	}
+	if err := s.DeleteDevice(ctx, device.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetDeviceKafkaConfig(ctx, device.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("get deleted config error = %v", err)
+	}
+}
+
+func TestKafkaSettingsDefaultsAndUpdates(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	cfg, err := s.GetKafkaSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Enabled || cfg.ClientID != "modbus-scan" || cfg.KafkaVersion != "3.0.0" || cfg.QueueCapacity != 1000 || len(cfg.Brokers) != 0 {
+		t.Fatalf("default settings = %#v", cfg)
+	}
+	cfg.Enabled = true
+	cfg.Brokers = []string{"127.0.0.1:9092", "127.0.0.2:9092"}
+	cfg.SASLPassword = "secret"
+	updated, err := s.UpdateKafkaSettings(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Enabled || len(updated.Brokers) != 2 || updated.SASLPassword != "secret" {
+		t.Fatalf("updated settings = %#v", updated)
+	}
+}
+
 func TestCreateDeviceRejectsDuplicateName(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)

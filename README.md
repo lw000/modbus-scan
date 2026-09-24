@@ -153,6 +153,38 @@ internal/collector/    Modbus 连接、重连、采集和解析
 internal/udm/          实时值内存快照
 web/                   内嵌管理页面
 ```
+
+## Kafka 实时推送
+
+Kafka 全局连接配置和设备推送配置均保存在 SQLite，可在管理页面动态修改，无需重启服务或设备采集。新安装及数据库升级后 Kafka 默认关闭。
+
+- 设备列表页的“Kafka 设置”维护 brokers、Kafka 版本、SASL/TLS、队列容量和全局开关。
+- 设备详情页单独配置推送开关、Topic 和推送模式。
+- `full` 为全量模式：启用后的首轮扫描立即推送，之后按设备配置周期推送。
+- `change` 为变化模式：首轮建立基线，之后仅推送发生变化的点位。
+- 全量与变化模式互斥，每台设备只能选择一种。
+
+消息 Key 为设备 ID，Value 为 UTF-8 JSON：
+
+```json
+{
+  "schema_version": 1,
+  "message_type": "change",
+  "device": {"id": 12, "name": "PLC-01"},
+  "collected_at": "2026-09-24T10:30:00.123Z",
+  "points": {"Temperature": 25.6, "Running": true}
+}
+```
+
+服务先启动 HTTP/WebSocket 和 Kafka 内存队列，再启动设备采集。Broker 暂时不可达时采集继续运行，Kafka 在后台重连；队列满后丢弃最旧消息并记录告警，服务重启后不会补发历史消息。停止时先停止设备采集，再关闭 Kafka，最后关闭 HTTP 服务。
+
+管理接口包括 `GET/PUT /api/v1/kafka` 和 `GET/PUT /api/v1/devices/:id/kafka`。查询不会返回 SASL 密码；更新时密码留空表示保留原密码。当前管理页面没有登录认证，请保持监听 `127.0.0.1`，不要直接暴露到不可信网络。
+
+联调时先创建测试 Topic，在页面启用全局 Kafka 并为设备配置该 Topic，然后使用 Kafka 自带消费者验证：
+
+```powershell
+kafka-console-consumer.bat --bootstrap-server 127.0.0.1:9092 --topic modbus-values --from-beginning
+```
 # 点位批量删除与实时值
 
 设备详情页支持删除当前筛选结果的当前页点位。后端接口为 `DELETE /api/v1/devices/:id/points`，JSON 请求体为 `{"ids":[1,2]}`；一次允许 1 到 500 个不重复的正整数 ID，所有点位必须属于该设备，删除在一个事务中完成。
